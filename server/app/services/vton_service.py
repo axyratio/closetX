@@ -1,0 +1,1167 @@
+# app/services/vton_service.py
+"""
+Service สำหรับจัดการระบบ Virtual Try-On (VTON)
+รวมการเรียก IDM VTON API
+"""
+import io
+import json
+import os
+import time
+import uuid
+import requests
+import base64
+from typing import Optional
+from uuid import UUID
+from io import BytesIO
+from PIL import Image
+from rembg import remove
+
+from fastapi import UploadFile
+from sqlalchemy.orm import Session
+
+from app.models.user import User
+from app.models.product import UserTryOnImage, VTONSession, ProductVariant, ProductImage
+# from app.models.vton_background import VTONBackground
+from app.models.garment_image import GarmentImage
+from app.models.garment_image import user_product_garments
+from app.utils.file_util import save_file, delete_file, rollback_and_cleanup
+from app.utils.now_utc import now_utc
+from app.utils.response_handler import success_response, error_response
+
+
+def _log(level: str, event: str, **kwargs):
+    """Structured Logging (JSON) as per AI_GUIDELINES.md Phase 7"""
+    print(json.dumps({
+        "timestamp": now_utc().isoformat(),
+        "level": level.upper(),
+        "service": "vton-service",
+        "event": event,
+        **kwargs
+    }))
+
+# ==================== IMAGE PROCESSING (REMBG) ====================
+
+def _process_image_rembg(
+    file_bytes: bytes,
+    max_size: int = 1024,
+    padding: int = 30
+) -> bytes:
+    """
+    ลบพื้นหลัง, crop, resize, จัดกึ่งกลาง และเพิ่ม padding
+    คืนค่า bytes ของ PNG ที่พร้อมบันทึก
+    """
+    # 1. ลบพื้นหลังด้วย rembg
+    removed = remove(file_bytes)
+    img = Image.open(BytesIO(removed)).convert("RGBA")
+
+    # 2. crop เฉพาะส่วนวัตถุ
+    bbox = img.getbbox()
+    if not bbox:
+        # ถ้าไม่พบวัตถุ คืนค่ารูปเดิมในรูปแบบ PNG
+        buf = BytesIO()
+        img.save(buf, "PNG")
+        return buf.getvalue()
+
+    cropped = img.crop(bbox)
+
+    # 3. resize ให้ด้านที่ยาวที่สุดไม่เกิน (max_size - padding*2)
+    inner_max = max_size - (padding * 2)
+    cropped.thumbnail((inner_max, inner_max), Image.Resampling.LANCZOS)
+
+    # 4. สร้าง canvas ใหม่พร้อม padding และจัดวัตถุกึ่งกลาง
+    canvas_w = cropped.width + (padding * 2)
+    canvas_h = cropped.height + (padding * 2)
+    final = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    final.paste(cropped, (padding, padding), cropped)
+
+    # 5. คืนค่าเป็น bytes (PNG)
+    buf = BytesIO()
+    final.save(buf, "PNG")
+    return buf.getvalue()
+
+# ==================== IDM VTON API ====================
+
+def _get_idm_api_config():
+    """ดึงค่า config สำหรับ IDM API"""
+    return {
+        "url": os.getenv("IDM_VTON_URL", "https://api.segmind.com/v1/idm-vton"),
+        "api_key": os.getenv("IDM_VTON_API_KEY", ""),
+        "timeout": int(os.getenv("IDM_VTON_TIMEOUT", "380"))
+    }
+
+def _image_to_base64(image_path: str) -> str:
+    """แปลงไฟล์รูปภาพเป็น base64 string"""
+    try:
+        with open(image_path, 'rb') as img_file:
+            return base64.b64encode(img_file.read()).decode('utf-8')
+    except Exception as e:
+        print(f"❌ Error converting image to base64: {e}")
+        return ""
+
+def _image_url_to_base64(image_url: str) -> str:
+    """แปลง URL หรือ path ของรูปเป็น data URL base64"""
+    try:
+        # ถ้าเป็น local path
+        if os.path.exists(image_url):
+            with open(image_url, 'rb') as f:
+                img_data = f.read()
+                return f"data:image/jpeg;base64,{base64.b64encode(img_data).decode()}"
+        
+        # ถ้าเป็น URL ให้ดาวน์โหลด
+        response = requests.get(image_url, timeout=10)
+        response.raise_for_status()
+        img_data = response.content
+        return f"data:image/jpeg;base64,{base64.b64encode(img_data).decode()}"
+    except Exception as e:
+        print(f"❌ Error converting URL to base64: {e}")
+        return image_url  # fallback ใช้ URL เดิม
+
+def _call_idm_vton_api(
+    human_img_url: str,
+    garment_img_url: str,
+    garment_description: str = "",
+    category: str = "upper_body",
+    steps: int = 30,
+    seed: int = 42
+) -> dict:
+    """
+    เรียก IDM VTON API
+    
+    Parameters:
+    - human_img_url: URL หรือ path ของรูปโมเดล
+    - garment_img_url: URL หรือ path ของรูปเสื้อผ้า
+    - garment_description: คำอธิบายเสื้อผ้า
+    - category: ประเภทเสื้อผ้า (upper_body, lower_body, dresses)
+    - steps: จำนวน steps ในการ generate (20-50)
+    - seed: random seed
+    
+    Returns:
+    - dict: {"success": bool, "image_url": str, "error": str}
+    """
+    config = _get_idm_api_config()
+    _log("INFO", "vton_segmind_api_started", url=config["url"])
+    
+    if not config["api_key"]:
+        return {
+            "success": False,
+            "image_url": None,
+            "error": "IDM_VTON_API_KEY not configured"
+        }
+    
+    try:
+        start_time = time.perf_counter()
+        # เตรียม headers
+        headers = {
+            "x-api-key": config["api_key"],
+            "Content-Type": "application/json"
+        }
+        
+        # แปลงรูปภาพเป็น base64 data URL
+        # human_img_data = _image_url_to_base64(human_img_url)
+        # garment_img_data = _image_url_to_base64(garment_img_url)
+        
+        # เตรียม payload
+        payload = {
+            "crop": True,
+            "seed": seed,
+            "steps": steps,
+            "category": category,
+            "force_dc": False,
+            "human_img": human_img_url,
+            "garm_img": garment_img_url,
+            "mask_only": False,
+            "garment_des": garment_description or "a clothing"
+        }
+        
+        # เรียก API
+        
+        response = requests.post(
+            config["url"],
+            headers=headers,
+            json=payload,
+            timeout=config["timeout"]
+        )
+        
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        
+        if response.status_code == 200:
+            ct = (response.headers.get("Content-Type") or "").lower()
+
+            if ct.startswith("image/"):
+                result_filename = f"vton_result_{uuid.uuid4().hex}.jpg"
+                result_dir = "app/uploads/vton/results"
+
+                # 1. แปลง bytes จาก response เป็น File-like object (BytesIO)
+                content_io = io.BytesIO(response.content)
+
+                # 2. จำลอง UploadFile object เพื่อให้ใช้กับฟังก์ชัน save_file ได้
+                # เพราะ save_file ของคุณมีการเรียกใช้ file.file ข้างใน
+                fake_upload_file = UploadFile(
+                    file=content_io, 
+                    filename=result_filename
+                )
+
+                # 3. เรียกใช้ save_file ที่คุณเขียนไว้ 
+                # (มันจะจัดการเช็คเองว่าต้องลง Disk หรือ Cloudinary ตาม ENV)
+                final_url_or_path = save_file(result_dir, fake_upload_file, result_filename)
+
+                _log("INFO", "vton_segmind_api_completed", 
+                    duration_ms=round(duration_ms, 2), 
+                    result_url=final_url_or_path
+                )
+                
+                return {
+                    "success": True,
+                    "image_url": final_url_or_path,
+                    "error": None
+                }
+            
+            # กรณีเป็น JSON
+            try:
+                result = response.json()
+            except Exception as e:
+                error_msg = f"IDM API exception: response is not JSON ({str(e)})"
+                _log("ERROR", "vton_segmind_api_failed", error=error_msg)
+                return {
+                    "success": False,
+                    "image_url": None,
+                    "error": error_msg
+                }
+            
+            # IDM API ส่งผลลัพธ์เป็น base64 image
+            if isinstance(result, dict) and "image" in result and result["image"]:
+                # บันทึกรูปผลลัพธ์
+                result_image_data = base64.b64decode(result["image"])
+                
+                # สร้าง unique filename
+                result_filename = f"vton_result_{uuid.uuid4().hex}.jpg"
+                result_dir = "app/uploads/vton/results"
+                os.makedirs(result_dir, exist_ok=True)
+                result_path = os.path.join(result_dir, result_filename)
+                
+                # บันทึกไฟล์
+                with open(result_path, 'wb') as f:
+                    f.write(result_image_data)
+                
+                _log("INFO", "vton_segmind_api_completed", 
+                    duration_ms=round(duration_ms, 2), 
+                    result_url=result_path
+                )
+                
+                return {
+                    "success": True,
+                    "image_url": result_path,
+                    "error": None
+                }
+            else:
+                return {
+                    "success": False,
+                    "image_url": None,
+                    "error": "No image in API response"
+                }
+        else:
+            error_msg = f"IDM API error: {response.status_code} - {response.text}"
+            _log("ERROR", "vton_segmind_api_failed", error=error_msg)
+            return {
+                "success": False,
+                "image_url": None,
+                "error": error_msg
+            }
+            
+    except Exception as e:
+        error_msg = f"IDM API exception: {str(e)}"
+        _log("ERROR", "vton_segmind_api_failed", error=error_msg)
+        return {
+            "success": False,
+            "image_url": None,
+            "error": error_msg
+        }
+
+def _call_gradio_vton_api(
+    human_img_url: str,
+    garment_img_url: str,
+    garment_description: str = "",
+    steps: int = 30,
+    seed: int = 42
+) -> dict:
+    """เรียกใช้งาน IDM-VTON ผ่าน Gradio Hugging Face Space"""
+    try:
+        from gradio_client import Client, handle_file
+    except ImportError:
+        _log("ERROR", "gradio_import_failed", error="gradio_client not installed")
+        return {"success": False, "image_url": None, "error": "gradio_client is not installed"}
+
+    space_name = os.getenv("HF_SPACE_NAME", "axioray/IDM-VTON")
+    auth_user = os.getenv("HF_AUTH_USER", "axio")
+    auth_pass = os.getenv("HF_AUTH_PASS", "ktpusa2100")
+
+    try:
+        start_time = time.perf_counter()
+        _log("INFO", "gradio_vton_started", space_name=space_name)
+        
+        client = Client(space_name, auth=(auth_user, auth_pass))
+        
+        result = client.predict(
+            {"background": handle_file(human_img_url), "layers": [], "composite": None},
+            handle_file(garment_img_url),
+            garment_description or "a clothing",
+            True,   # is_checked
+            True,  # is_checked_crop
+            steps,
+            seed,
+            api_name="/tryon"
+        )
+        
+        output_image_path = result[0]
+        
+        result_filename = f"vton_result_{uuid.uuid4().hex}.jpg"
+        result_dir = "app/uploads/vton/results"
+        
+        with open(output_image_path, "rb") as f:
+            content_io = io.BytesIO(f.read())
+        
+        fake_upload_file = UploadFile(
+            file=content_io,
+            filename=result_filename
+        )
+        
+        final_url_or_path = save_file(result_dir, fake_upload_file, result_filename)
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        
+        _log("INFO", "gradio_vton_completed", 
+            duration_ms=round(duration_ms, 2), 
+            result_url=final_url_or_path
+        )
+        
+        return {
+            "success": True,
+            "image_url": final_url_or_path,
+            "error": None
+        }
+        
+    except Exception as e:
+        _log("ERROR", "gradio_vton_failed", error=str(e))
+        return {"success": False, "image_url": None, "error": str(e)}
+
+def _dispatch_vton_api(
+    human_img_url: str,
+    garment_img_url: str,
+    garment_description: str = "",
+    category: str = "upper_body",
+    steps: int = 30,
+    seed: int = 42
+) -> dict:
+    """เลือกเรียก API ระหว่าง Gradio HF Space หรือ Segmind REST API"""
+    provider = os.getenv("VTON_PROVIDER", "segmind").lower()
+    
+    if provider == "gradio":
+        return _call_gradio_vton_api(
+            human_img_url=human_img_url,
+            garment_img_url=garment_img_url,
+            garment_description=garment_description,
+            steps=steps,
+            seed=seed
+        )
+    if provider =="segmind":
+        return _call_idm_vton_api(
+            human_img_url=human_img_url,
+            garment_img_url=garment_img_url,
+            garment_description=garment_description,
+            category=category,
+            steps=steps,
+            seed=seed
+        )
+
+def _resolve_garment_image_url(
+    db: Session, 
+    user_id: UUID, 
+    garment_id: Optional[UUID], 
+    product_id: Optional[UUID], 
+    variant_id: Optional[UUID]
+) -> Optional[str]:
+    """ดึง URL ของเสื้อผ้าจาก GarmentImage หรือ ProductVariant"""
+    if garment_id:
+        garment = (
+            db.query(GarmentImage)
+            .filter(
+                GarmentImage.garment_id == garment_id,
+                GarmentImage.user_id == user_id,
+                GarmentImage.is_valid == True
+            )
+            .first()
+        )
+        return garment.image_url if garment else None
+
+    if product_id and variant_id:
+        variant = (
+            db.query(ProductVariant)
+            .filter(
+                ProductVariant.variant_id == variant_id,
+                ProductVariant.product_id == product_id,
+                ProductVariant.is_active == True
+            )
+            .first()
+        )
+        if not variant:
+            return None
+
+        images = list(getattr(variant, "images", []) or [])
+        if not images:
+            return None
+
+        main_img = next((img for img in images if getattr(img, "is_main", False)), None)
+        chosen_img = main_img or images[0]
+        return chosen_img.image_url
+
+    return None
+
+# ==================== USER TRYON IMAGES ====================
+
+async def upload_user_tryon_image(
+    db: Session,
+    user: User,
+    file: UploadFile
+):
+    """อัปโหลดรูปโมเดลของผู้ใช้ (บันทึกรูปต้นฉบับ ไม่ลบพื้นหลัง)"""
+    saved_path = None
+    try:
+        if not file.content_type or not file.content_type.startswith("image/"):
+            return error_response("รองรับเฉพาะไฟล์รูปภาพเท่านั้น", {}, 400)
+
+        content = await file.read()
+        if len(content) > 5 * 1024 * 1024:  # 5MB
+            return error_response("ขนาดไฟล์ต้องไม่เกิน 5MB", {}, 413)
+
+        file.file.seek(0)
+
+        upload_dir = "app/uploads/vton/user_images"
+        ext = os.path.splitext(file.filename or "")[1] or ".jpg"
+        unique_name = f"{uuid.uuid4().hex}{ext}"
+
+        saved_path = save_file(upload_dir, file, unique_name)
+
+        new_image = UserTryOnImage(
+            user_id=user.user_id,
+            image_url=saved_path,
+            is_valid=True  # TODO: ส่งไปตรวจสอบด้วย AI ว่ารูปเหมาะสมไหม
+        )
+
+        db.add(new_image)
+        db.commit()
+        db.refresh(new_image)
+
+        return success_response(
+            "อัปโหลดรูปโมเดลสำเร็จ",
+            {
+                "user_image_id": str(new_image.user_image_id),
+                "image_url": new_image.image_url,
+                "is_valid": new_image.is_valid,
+                "uploaded_at": new_image.uploaded_at.isoformat() if new_image.uploaded_at else None
+            },
+            201
+        )
+
+    except Exception as e:
+        if saved_path:
+            rollback_and_cleanup(db, saved_path)
+        else:
+            db.rollback()
+
+        print(f"❌ Error uploading user tryon image: {e}")
+        return error_response("อัปโหลดรูปภาพล้มเหลว", {"error": str(e)}, 500)
+
+def get_user_tryon_images(db: Session, user: User):
+    """ดึงรูปโมเดลทั้งหมดของผู้ใช้"""
+    try:
+        images = (
+            db.query(UserTryOnImage)
+            .filter(
+                UserTryOnImage.user_id == user.user_id,
+                UserTryOnImage.is_valid == True
+            )
+            .order_by(UserTryOnImage.uploaded_at.desc())
+            .all()
+        )
+
+        return success_response(
+            "ดึงข้อมูลสำเร็จ",
+            {
+                "images": [
+                    {
+                        "user_image_id": str(img.user_image_id),
+                        "image_url": img.image_url,
+                        "uploaded_at": img.uploaded_at.isoformat() if img.uploaded_at else None,
+                        "is_valid": img.is_valid
+                    }
+                    for img in images
+                ]
+            }
+        )
+    except Exception as e:
+        return error_response("เกิดข้อผิดพลาด", {"error": str(e)}, 500)
+
+def delete_user_tryon_image(db: Session, user: User, user_image_id: UUID):
+    """ลบรูปโมเดล"""
+    try:
+        image = (
+            db.query(UserTryOnImage)
+            .filter(
+                UserTryOnImage.user_image_id == user_image_id,
+                UserTryOnImage.user_id == user.user_id
+            )
+            .first()
+        )
+
+        if not image:
+            return error_response("ไม่พบรูปภาพ", {}, 404)
+
+        delete_file(image.image_url)
+
+        db.delete(image)
+        db.commit()
+
+        return success_response("ลบรูปภาพสำเร็จ", {})
+
+    except Exception as e:
+        db.rollback()
+        return error_response("เกิดข้อผิดพลาดในการลบรูปภาพ", {"error": str(e)}, 500)
+
+# ==================== GARMENT IMAGES (OUTFIT) ====================
+
+async def upload_garment_image(
+    db: Session,
+    user: User,
+    file: UploadFile,
+    name: Optional[str] = None
+):
+    """อัปโหลดรูปเสื้อผ้า (Outfit) ที่ไม่เกี่ยวกับ Product (พร้อมลบพื้นหลังอัตโนมัติด้วย rembg)"""
+    saved_path = None
+    try:
+        if not file.content_type or not file.content_type.startswith("image/"):
+            return error_response("รองรับเฉพาะไฟล์รูปภาพเท่านั้น", {}, 400)
+
+        content = await file.read()
+        if len(content) > 5 * 1024 * 1024:
+            return error_response("ขนาดไฟล์ต้องไม่เกิน 5MB", {}, 413)
+
+        #  ลบพื้นหลัง, crop, resize และจัดกึ่งกลางด้วย rembg
+        print("🔄 Processing garment image with rembg (background removal)...")
+        processed_bytes = _process_image_rembg(content, max_size=1024, padding=30)
+        print(" Background removal complete for garment image")
+
+        upload_dir = "app/uploads/vton/garments"
+        unique_name = f"{uuid.uuid4().hex}.png"  # บันทึกเป็น PNG เพื่อรักษา transparency
+
+        fake_upload_file = UploadFile(
+            file=BytesIO(processed_bytes),
+            filename=unique_name
+        )
+        saved_path = save_file(upload_dir, fake_upload_file, unique_name)
+
+        new_garment = GarmentImage(
+            user_id=user.user_id,
+            name=name or "Untitled Garment",
+            image_url=saved_path,
+            is_valid=True  # TODO: ตรวจสอบด้วย AI
+        )
+
+        db.add(new_garment)
+        db.commit()
+        db.refresh(new_garment)
+
+        return success_response(
+            "อัปโหลดรูปเสื้อผ้าสำเร็จ",
+            {
+                "garment_id": str(new_garment.garment_id),
+                "name": new_garment.name,
+                "image_url": new_garment.image_url,
+                "is_valid": new_garment.is_valid,
+                "uploaded_at": new_garment.uploaded_at.isoformat() if new_garment.uploaded_at else None
+            },
+            201
+        )
+
+    except Exception as e:
+        if saved_path:
+            rollback_and_cleanup(db, saved_path)
+        else:
+            db.rollback()
+
+        print(f"❌ Error uploading garment image: {e}")
+        return error_response("อัปโหลดรูปเสื้อผ้าล้มเหลว", {"error": str(e)}, 500)
+
+def get_garment_images(db: Session, user: User):
+    """ดึงรูปเสื้อผ้าทั้งหมดของผู้ใช้"""
+    try:
+        garments = (
+            db.query(GarmentImage)
+            .filter(
+                GarmentImage.user_id == user.user_id,
+                GarmentImage.is_valid == True
+            )
+            .order_by(GarmentImage.uploaded_at.desc())
+            .all()
+        )
+
+        return success_response(
+            "ดึงข้อมูลสำเร็จ",
+            {
+                "garments": [
+                    {
+                        "garment_id": str(g.garment_id),
+                        "name": g.name,
+                        "image_url": g.image_url,
+                        "uploaded_at": g.uploaded_at.isoformat() if g.uploaded_at else None,
+                        "is_valid": g.is_valid
+                    }
+                    for g in garments
+                ]
+            }
+        )
+    except Exception as e:
+        return error_response("เกิดข้อผิดพลาด", {"error": str(e)}, 500)
+
+def delete_garment_image(db: Session, user: User, garment_id: UUID):
+    """ลบรูปเสื้อผ้า"""
+    try:
+        garment = (
+            db.query(GarmentImage)
+            .filter(
+                GarmentImage.garment_id == garment_id,
+                GarmentImage.user_id == user.user_id
+            )
+            .first()
+        )
+
+        if not garment:
+            return error_response("ไม่พบรูปเสื้อผ้า", {}, 404)
+
+        delete_file(garment.image_url)
+
+        db.delete(garment)
+        db.commit()
+
+        return success_response("ลบรูปเสื้อผ้าสำเร็จ", {})
+
+    except Exception as e:
+        db.rollback()
+        print(f"[GARMENT DELETE ERROR] {e}")
+        return error_response("เกิดข้อผิดพลาด", {"error": str(e)}, 500)
+
+# ==================== PRODUCT GARMENTS (เสื้อจากสินค้า) ====================
+
+def add_product_garment(db: Session, user: User, product_id: UUID, variant_id: UUID):
+    """เพิ่มสินค้าเข้า 'เสื้อจากสินค้า'"""
+    try:
+        variant = (
+            db.query(ProductVariant)
+            .filter(
+                ProductVariant.variant_id == variant_id,
+                ProductVariant.product_id == product_id,
+                ProductVariant.is_active == True
+            )
+            .first()
+        )
+
+        if not variant:
+            return error_response("ไม่พบสินค้า", {}, 404)
+
+        existing = (
+            db.execute(
+                user_product_garments.select().where(
+                    user_product_garments.c.user_id == user.user_id,
+                    user_product_garments.c.variant_id == variant_id
+                )
+            ).fetchone()
+        )
+
+        if existing:
+            return success_response(
+                "สินค้านี้ถูกเพิ่มไว้แล้ว",
+                {"already_exists": True},
+                200
+            )
+
+        db.execute(
+            user_product_garments.insert().values(
+                user_id=user.user_id,
+                variant_id=variant_id,
+                added_at=now_utc()
+            )
+        )
+        db.commit()
+
+        return success_response("เพิ่มสินค้าสำเร็จ", {"already_exists": False}, 201)
+
+    except Exception as e:
+        db.rollback()
+        print(f"❌ Error adding product garment: {e}")
+        return error_response("เพิ่มสินค้าล้มเหลว", {"error": str(e)}, 500)
+
+def get_product_garments(db: Session, user: User):
+    """ดึงรายการเสื้อจากสินค้าทั้งหมด"""
+    try:
+        results = (
+            db.query(ProductVariant)
+            .join(
+                user_product_garments,
+                ProductVariant.variant_id == user_product_garments.c.variant_id
+            )
+            .filter(user_product_garments.c.user_id == user.user_id)
+            .order_by(user_product_garments.c.added_at.desc())
+            .all()
+        )
+
+        product_garments = []
+        for variant in results:
+            product_garments.append({
+                "variant_id": str(variant.variant_id),
+                "product_id": str(variant.product_id),
+                "color": variant.color,
+                "size": variant.size,
+                "name_option": variant.name_option,
+                "sku": variant.sku,
+                "price": variant.price,
+                "stock": variant.stock,
+                "is_active": variant.is_active,
+                "images": [
+                    {
+                        "image_id": str(img.image_id),
+                        "image_url": img.image_url,
+                        "image_type": img.image_type,
+                        "display_order": img.display_order,
+                        "is_main": img.is_main
+                    }
+                    for img in variant.images
+                ]
+            })
+
+        return success_response(
+            "ดึงข้อมูลสำเร็จ",
+            {"product_garments": product_garments}
+        )
+
+    except Exception as e:
+        print(f"❌ Error getting product garments: {e}")
+        return error_response("เกิดข้อผิดพลาด", {"error": str(e)}, 500)
+
+def delete_product_garment(db: Session, user: User, variant_id: UUID):
+    """ลบเสื้อจากสินค้า"""
+    try:
+        result = db.execute(
+            user_product_garments.delete().where(
+                user_product_garments.c.user_id == user.user_id,
+                user_product_garments.c.variant_id == variant_id
+            )
+        )
+
+        if result.rowcount == 0:
+            return error_response("ไม่พบสินค้า", {}, 404)
+
+        db.commit()
+        return success_response("ลบสินค้าสำเร็จ", {})
+
+    except Exception as e:
+        db.rollback()
+        return error_response("เกิดข้อผิดพลาด", {"error": str(e)}, 500)
+
+# ==================== VTON BACKGROUNDS ====================
+
+# async def upload_vton_background(
+#     db: Session,
+#     user: User,
+#     file: UploadFile,
+#     name: str,
+#     category: Optional[str] = None
+# ):
+#     """อัปโหลดพื้นหลังส่วนตัว"""
+#     saved_path = None
+#     try:
+#         if not file.content_type or not file.content_type.startswith("image/"):
+#             return error_response("รองรับเฉพาะไฟล์รูปภาพเท่านั้น", {}, 400)
+
+#         content = await file.read()
+#         if len(content) > 5 * 1024 * 1024:
+#             return error_response("ขนาดไฟล์ต้องไม่เกิน 5MB", {}, 413)
+
+#         file.file.seek(0)
+
+#         upload_dir = "app/uploads/vton/backgrounds"
+#         ext = os.path.splitext(file.filename or "")[1] or ".jpg"
+#         unique_name = f"{uuid.uuid4().hex}{ext}"
+
+#         saved_path = save_file(upload_dir, file, unique_name)
+
+#         new_background = VTONBackground(
+#             name=name,
+#             image_url=saved_path,
+#             category=category,
+#             is_system=False,
+#             user_id=user.user_id,
+#             is_active=True
+#         )
+
+#         db.add(new_background)
+#         db.commit()
+#         db.refresh(new_background)
+
+#         return success_response(
+#             "อัปโหลดพื้นหลังสำเร็จ",
+#             {
+#                 "background_id": str(new_background.background_id),
+#                 "name": new_background.name,
+#                 "image_url": new_background.image_url,
+#                 "category": new_background.category,
+#                 "is_system": new_background.is_system
+#             },
+#             201
+#         )
+
+#     except Exception as e:
+#         if saved_path:
+#             rollback_and_cleanup(db, saved_path)
+#         else:
+#             db.rollback()
+
+#         print(f"❌ Error uploading background: {e}")
+#         return error_response("อัปโหลดพื้นหลังล้มเหลว", {"error": str(e)}, 500)
+
+# def get_vton_backgrounds(db: Session, user: User):
+#     """ดึงพื้นหลังทั้งหมด (System + User's own)"""
+#     try:
+#         backgrounds = (
+#             db.query(VTONBackground)
+#             .filter(
+#                 VTONBackground.is_active == True,
+#                 (VTONBackground.is_system == True) |
+#                 (VTONBackground.user_id == user.user_id)
+#             )
+#             .order_by(
+#                 VTONBackground.is_system.desc(),
+#                 VTONBackground.created_at.desc()
+#             )
+#             .all()
+#         )
+
+#         return success_response(
+#             "ดึงข้อมูลสำเร็จ",
+#             {
+#                 "backgrounds": [
+#                     {
+#                         "background_id": str(bg.background_id),
+#                         "name": bg.name,
+#                         "image_url": bg.image_url,
+#                         "category": bg.category,
+#                         "is_system": bg.is_system,
+#                         "user_id": str(bg.user_id) if bg.user_id else None,
+#                         "created_at": bg.created_at.isoformat() if bg.created_at else None
+#                     }
+#                     for bg in backgrounds
+#                 ]
+#             }
+#         )
+#     except Exception as e:
+#         return error_response("เกิดข้อผิดพลาด", {"error": str(e)}, 500)
+
+# def delete_vton_background(db: Session, user: User, background_id: UUID):
+#     """ลบพื้นหลัง (เฉพาะที่ผู้ใช้สร้างเอง)"""
+#     try:
+#         background = (
+#             db.query(VTONBackground)
+#             .filter(
+#                 VTONBackground.background_id == background_id,
+#                 VTONBackground.user_id == user.user_id,
+#                 VTONBackground.is_system == False
+#             )
+#             .first()
+#         )
+
+#         if not background:
+#             return error_response("ไม่พบพื้นหลังหรือไม่มีสิทธิ์ลบ", {}, 404)
+
+#         delete_file(background.image_url)
+
+#         db.delete(background)
+#         db.commit()
+
+#         return success_response("ลบพื้นหลังสำเร็จ", {})
+
+#     except Exception as e:
+#         db.rollback()
+#         return error_response("เกิดข้อผิดพลาด", {"error": str(e)}, 500)
+
+# ==================== VTON SESSION ====================
+
+def create_vton_session(
+    db: Session,
+    user: User,
+    user_image_id: UUID,
+    background_id: Optional[UUID] = None,
+    product_id: Optional[UUID] = None,
+    variant_id: Optional[UUID] = None,
+    garment_id: Optional[UUID] = None,
+    garment_description: str = "",
+    category: str = "upper_body",
+    steps: int = 30,
+    seed: int = 42
+):
+    """
+    สร้าง VTON Session (ลองเสื้อ) โดยเรียก IDM VTON API
+    - รองรับทั้งเสื้อจาก Product (product_id + variant_id)
+    - และเสื้อจาก Garment Images (garment_id)
+    """
+    try:
+        start_time = time.perf_counter()
+        
+        # ✅ Validation
+        if not product_id and not garment_id:
+            return error_response(
+                "ต้องระบุ product_id หรือ garment_id อย่างใดอย่างหนึ่ง",
+                {},
+                400
+            )
+
+        user_img = (
+            db.query(UserTryOnImage)
+            .filter(
+                UserTryOnImage.user_image_id == user_image_id,
+                UserTryOnImage.user_id == user.user_id,
+                UserTryOnImage.is_valid == True
+            )
+            .first()
+        )
+        if not user_img:
+            return error_response("ไม่พบรูปโมเดลหรือรูปไม่ผ่านการตรวจสอบ", {}, 404)
+
+        garment_img_url = _resolve_garment_image_url(
+            db, user.user_id, garment_id, product_id, variant_id
+        )
+        if not garment_img_url:
+            return error_response("ไม่พบรูปเสื้อผ้าหรือสินค้าไม่มีสิทธิ์ใช้งาน", {}, 404)
+
+        # ✅ สร้าง garment_description อัตโนมัติถ้าไม่ได้ระบุ เพื่อป้องกันโมเดลเปลี่ยนสีเสื้อเอง (Color Shifting)
+        if not garment_description:
+            desc_parts = []
+            if product_id and variant_id:
+                from app.models.product import Product
+                variant = db.query(ProductVariant).filter(ProductVariant.variant_id == variant_id).first()
+                product = db.query(Product).filter(Product.product_id == product_id).first()
+                
+                if variant:
+                    if getattr(variant, "color", None):
+                        desc_parts.append(variant.color)
+                    elif getattr(variant, "name_option", None):
+                        desc_parts.append(variant.name_option)
+                if product and getattr(product, "product_name", None):
+                    desc_parts.append(product.product_name)
+            elif garment_id:
+                garment = db.query(GarmentImage).filter(GarmentImage.garment_id == garment_id).first()
+                if garment and getattr(garment, "name", None):
+                    desc_parts.append(garment.name)
+            
+            garment_description = " ".join(desc_parts) if desc_parts else "a clothing"
+
+        _log(
+            "INFO", 
+            "vton_session_started", 
+            user_id=str(user.user_id),
+            human_image_url=user_img.image_url,
+            garment_image_url=garment_img_url
+        )
+
+        # ✅ เรียก VTON API (Gradio หรือ Segmind แบบ Dynamic)
+        api_result = _dispatch_vton_api(
+            human_img_url=user_img.image_url,
+            garment_img_url=garment_img_url,
+            garment_description=garment_description,
+            category=category,
+            steps=steps,
+            seed=seed
+        )
+
+        if not api_result.get("success"):
+            return error_response("สร้างภาพลองเสื้อล้มเหลว", {"error": api_result.get("error")}, 502)
+
+        result_image_url = api_result.get("image_url")
+        provider_used = os.getenv("VTON_PROVIDER", "gradio").upper()
+
+        session = VTONSession(
+            user_id=user.user_id,
+            product_id=product_id,
+            variant_id=variant_id,
+            garment_id=garment_id,
+            user_image_id=user_image_id,
+            result_image_url=result_image_url,
+            model_used=provider_used,
+            generated_at=now_utc()
+        )
+
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        _log("INFO", "vton_session_completed", 
+            session_id=str(session.session_id), 
+            duration_ms=round(duration_ms, 2)
+        )
+
+        return success_response(
+            "สร้าง VTON Session สำเร็จ",
+            {
+                "session_id": str(session.session_id),
+                "result_image_url": session.result_image_url,
+                "model_used": session.model_used,
+                "generated_at": session.generated_at.isoformat() if session.generated_at else None
+            },
+            201
+        )
+
+    except Exception as e:
+        db.rollback()
+        _log("ERROR", "vton_session_creation_failed", error=str(e))
+        return error_response("เกิดข้อผิดพลาด", {"error": str(e)}, 500)
+
+def delete_vton_session(db: Session, user: User, session_id: UUID):
+    """ลบ VTON Session และไฟล์รูปผลลัพธ์"""
+    try:
+        # ✅ ตรวจสอบว่า session เป็นของ user
+        session = (
+            db.query(VTONSession)
+            .filter(
+                VTONSession.session_id == session_id,
+                VTONSession.user_id == user.user_id
+            )
+            .first()
+        )
+
+        if not session:
+            return error_response("ไม่พบรูปผลลัพธ์หรือไม่มีสิทธิ์ลบ", {}, 404)
+
+        # ✅ ลบไฟล์รูปผลลัพธ์ (ถ้ามี)
+        if session.result_image_url:
+            try:
+                delete_file(session.result_image_url)
+                print(f"✅ Deleted result image: {session.result_image_url}")
+            except Exception as e:
+                print(f"⚠️ Warning: Could not delete result image file: {e}")
+
+        # ✅ ลบ record จาก database
+        db.delete(session)
+        db.commit()
+
+        return success_response("ลบรูปผลลัพธ์สำเร็จ", {})
+
+    except Exception as e:
+        db.rollback()
+        print(f"❌ Error deleting VTON session: {e}")
+        return error_response("เกิดข้อผิดพลาดในการลบรูปผลลัพธ์", {"error": str(e)}, 500)
+    
+    
+# def change_background_from_session(
+#     db: Session,
+#     user: User,
+#     session_id: UUID,
+#     new_background_id: Optional[UUID]
+# ):
+#     """
+#     เปลี่ยนพื้นหลังจากผลลัพธ์เดิม
+#     - ใช้ result_image จาก session เดิม
+#     - เปลี่ยนแค่พื้นหลัง
+#     """
+#     try:
+#         old_session = (
+#             db.query(VTONSession)
+#             .filter(
+#                 VTONSession.session_id == session_id,
+#                 VTONSession.user_id == user.user_id
+#             )
+#             .first()
+#         )
+
+#         if not old_session:
+#             return error_response("ไม่พบ Session", {}, 404)
+
+#         # validate new background (optional)
+#         if new_background_id:
+#             bg = (
+#                 db.query(VTONBackground)
+#                 .filter(
+#                     VTONBackground.background_id == new_background_id,
+#                     VTONBackground.is_active == True,
+#                     (VTONBackground.is_system == True) |
+#                     (VTONBackground.user_id == user.user_id)
+#                 )
+#                 .first()
+#             )
+#             if not bg:
+#                 return error_response("ไม่พบพื้นหลังหรือไม่มีสิทธิ์ใช้งาน", {}, 404)
+
+#         # TODO: เรียก AI เพื่อเปลี่ยนพื้นหลัง
+#         new_result_url = "https://example.com/vton_new_bg_placeholder.jpg"
+
+#         new_session = VTONSession(
+#             user_id=user.user_id,
+#             product_id=old_session.product_id,
+#             variant_id=old_session.variant_id,
+#             garment_id=getattr(old_session, "garment_id", None),  # ✅ กันพังถ้ารุ่นเก่ายังไม่มี field
+#             user_image_id=old_session.user_image_id,
+#             background_id=new_background_id,
+#             result_image_url=new_result_url,
+#             model_used="Background-Swap-v1",
+#             generated_at=now_utc()
+#         )
+
+#         db.add(new_session)
+#         db.commit()
+#         db.refresh(new_session)
+
+#         return success_response(
+#             "เปลี่ยนพื้นหลังสำเร็จ",
+#             {
+#                 "session_id": str(new_session.session_id),
+#                 "result_image_url": new_session.result_image_url,
+#                 "background_id": str(new_background_id) if new_background_id else None
+#             },
+#             201
+#         )
+
+#     except Exception as e:
+#         db.rollback()
+#         return error_response("เกิดข้อผิดพลาด", {"error": str(e)}, 500)
+
+def get_vton_sessions(
+    db: Session,
+    user: User,
+    limit: int = 20
+):
+    """ดึงประวัติการลองเสื้อ"""
+    try:
+        sessions = (
+            db.query(VTONSession)
+            .filter(VTONSession.user_id == user.user_id)
+            .order_by(VTONSession.generated_at.desc())
+            .limit(limit)
+            .all()
+        )
+
+        return success_response(
+            "ดึงข้อมูลสำเร็จ",
+            {
+                "sessions": [
+                    {
+                        "session_id": str(s.session_id),
+                        "product_id": str(s.product_id) if s.product_id else None,
+                        "variant_id": str(s.variant_id) if s.variant_id else None,
+                        "garment_id": str(getattr(s, "garment_id", None)) if getattr(s, "garment_id", None) else None,
+                        "result_image_url": s.result_image_url,
+                        # "background_id": str(s.background_id) if s.background_id else None,
+                        "model_used": s.model_used,
+                        "generated_at": s.generated_at.isoformat() if s.generated_at else None
+                    }
+                    for s in sessions
+                ]
+            }
+        )
+    except Exception as e:
+        return error_response("เกิดข้อผิดพลาด", {"error": str(e)}, 500)
