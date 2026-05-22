@@ -1,17 +1,17 @@
 # closetX
 you can use this by command
 ```bash
-// in your client
+# in your client
 npm install
 
-// start project
+# start project
 npx expo start
 ```
 ```bash
-//in your server
+# in your server
 pip install -r requirements.py
 
-//start project for test
+# start project for test
 celery -A app.utils.order_task worker --loglevel=info --pool=solo
 
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
