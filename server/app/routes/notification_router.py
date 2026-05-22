@@ -41,7 +41,7 @@ async def get_my_notifications(
     )
     
     return {
-        "notifications": notifications,
+        "notifications": [NotificationService._serialize_notification(n) for n in notifications],
         "total": total,
         "unread_count": unread_count
     }
